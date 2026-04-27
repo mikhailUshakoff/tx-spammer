@@ -32,10 +32,10 @@ async fn main() -> Result<()> {
             let contract = deploy().await?;
             println!("Contract deployed at: {contract}");
         }
-        "spamm" => {
+        "spam" => {
             let token_address = parse_address_arg(args.next(), "token_address")?;
             let tps = parse_f64_arg(args.next(), "tps")?;
-            spamm(token_address, tps).await?;
+            spam(token_address, tps).await?;
         }
         "balance" => {
             let token_address = parse_address_arg(args.next(), "token_address")?;
@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
 fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  tx-spammer deploy");
-    eprintln!("  tx-spammer spamm <token_address> <tps>");
+    eprintln!("  tx-spammer spam <token_address> <tps>");
     eprintln!("  tx-spammer balance <token_address> <owner_address>");
     eprintln!("  tx-spammer block <block_number>");
 }
@@ -115,7 +115,7 @@ async fn deploy() -> Result<Address> {
         .ok_or_else(|| eyre!("No contract address in receipt"))
 }
 
-async fn spamm(contract: Address, tps: f64) -> Result<()> {
+async fn spam(contract: Address, tps: f64) -> Result<()> {
     if tps <= 0.0 {
         return Err(eyre!("tps must be greater than 0"));
     }

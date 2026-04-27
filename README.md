@@ -15,7 +15,7 @@ The binary will be at `target/release/tx-spammer`.
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `RPC_URL` | No | `http://localhost:8547` | HTTP RPC endpoint of the target node |
-| `PRIVATE_KEY` | For `deploy` and `spamm` | — | Hex-encoded private key used to sign transactions |
+| `PRIVATE_KEY` | For `deploy` and `spam` | — | Hex-encoded private key used to sign transactions |
 
 ## Commands
 
@@ -33,12 +33,12 @@ Reads the compiled artifact from `out/MyToken.sol/MyToken.json` (produced by For
 
 ---
 
-### `spamm <token_address> <tps>`
+### `spam <token_address> <tps>`
 
 Sends ERC20 `transfer` transactions to random addresses at the specified rate.
 
 ```bash
-tx-spammer spamm <token_address> <tps>
+tx-spammer spam <token_address> <tps>
 ```
 
 | Argument | Description |
@@ -92,7 +92,7 @@ tx-spammer deploy
 # Contract deployed at: 0xDeAdBeEf...
 
 # Spam at 50 TPS
-tx-spammer spamm 0xDeAdBeEf... 50
+tx-spammer spam 0xDeAdBeEf... 50
 
 # Check balance
 tx-spammer balance 0xDeAdBeEf... 0xYourAddress...
