@@ -271,22 +271,18 @@ async fn spam(contract: Address, tps: f64) -> Result<()> {
 
     println!("Spamming ERC20 transfers for {contract} at {tps} TPS...");
 
-    let mut interval = tokio::time::interval(Duration::from_secs_f64(1.0 / tps));
+    let txs_per_second = tps.ceil() as u64;
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
     let mut rng = rand::thread_rng();
     let mut count: u64 = 0;
 
-    //let mut nonce = provider.get_transaction_count(from).await?;
+    // Fetch initial nonce once before the loop
+    let mut nonce = provider.get_transaction_count(from).await?;
 
     loop {
         interval.tick().await;
 
-        let to = Address::from(rng.r#gen::<[u8; 20]>());
-        let calldata = transferCall {
-            to,
-            amount: U256::from(1u64),
-        }
-        .abi_encode();
-
+        // Fetch gas params ONCE per block, not per transaction
         let latest_block = provider
             .get_block_by_number(BlockNumberOrTag::Latest, BlockTransactionsKind::Hashes)
             .await?
@@ -302,22 +298,53 @@ async fn spam(contract: Address, tps: f64) -> Result<()> {
             .saturating_mul(2)
             .saturating_add(max_priority_fee_per_gas);
 
-        let tx = TransactionRequest::default()
-            .from(from)
-            .to(contract)
-            .input(calldata.into())
-            .with_max_fee_per_gas(max_fee_per_gas)
-            .with_max_priority_fee_per_gas(max_priority_fee_per_gas);
-        //tx.max_fee_per_gas = Some(max_fee_per_gas);
-        //tx.max_priority_fee_per_gas = Some(max_priority_fee_per_gas);
-        //tx.nonce = Some(nonce);
+        // Fire all txs for this second concurrently, each with its own nonce
+        let mut futures = Vec::with_capacity(txs_per_second as usize);
 
-        //nonce += 1;
+        for _ in 0..txs_per_second {
+            let to = Address::from(rng.r#gen::<[u8; 20]>());
+            let calldata = transferCall {
+                to,
+                amount: U256::from(1u64),
+            }
+            .abi_encode();
 
-        let _ = provider.send_transaction(tx).await?;
+            let tx = TransactionRequest::default()
+                .from(from)
+                .to(contract)
+                .input(calldata.into())
+                .with_nonce(nonce)
+                .with_max_fee_per_gas(max_fee_per_gas)
+                .with_max_priority_fee_per_gas(max_priority_fee_per_gas);
+            //println!("Prepared tx with nonce {}", nonce);
+            nonce += 1;
+            futures.push(provider.send_transaction(tx));
+        }
 
-        count += 1;
-        if count % 10000 == 0 {
+        // Send all transactions in this batch concurrently
+        let results = futures::future::join_all(futures).await;
+
+        let mut sent = 0u64;
+        let mut failed = 0u64;
+
+        for (i, result) in results.iter().enumerate() {
+            match result {
+                Ok(_) => sent += 1,
+                Err(e) => {
+                    eprintln!("Tx {i} failed: {e}");
+                    failed += 1;
+                }
+            }
+        }
+
+        count += sent;
+
+        if failed > 0 {
+            eprintln!("Batch had {failed} failures, resyncing nonce...");
+            nonce -= failed;
+        }
+
+        if count % 10_000 == 0 {
             println!("Sent {count} transactions");
         }
     }
