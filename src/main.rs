@@ -17,6 +17,12 @@ use std::time::Duration;
 sol! {
     function transfer(address to, uint256 amount) returns (bool);
     function balanceOf(address owner) view returns (uint256);
+    function stressAdd(uint256 iters);
+    function stressMulmod(uint256 iters);
+    function stressKeccak(uint256 iters);
+    function stressEcrecover(uint256 iters);
+    function stressBlake2f(uint256 iters);
+    function stressModexp(uint256 iters);
 }
 
 #[tokio::main]
@@ -36,6 +42,52 @@ async fn main() -> Result<()> {
             let token_address = parse_address_arg(args.next(), "token_address")?;
             let tps = parse_f64_arg(args.next(), "tps")?;
             spam(token_address, tps).await?;
+        }
+        "deploy-zkgas-stress" => {
+            let contract = deploy_zkgas_stress().await?;
+            println!("ZkGasStress deployed at: {contract}");
+        }
+        "spam-modexp" => {
+            let stress = parse_address_arg(args.next(), "stress_address")?;
+            let iters = parse_u64_arg(args.next(), "iters")?;
+            let tps = parse_f64_arg(args.next(), "tps")?;
+            let calldata = stressModexpCall { iters: U256::from(iters) }.abi_encode();
+            spam_calldata(stress, calldata, format!("stressModexp({iters})"), tps).await?;
+        }
+        "spam-add" => {
+            let stress = parse_address_arg(args.next(), "stress_address")?;
+            let iters = parse_u64_arg(args.next(), "iters")?;
+            let tps = parse_f64_arg(args.next(), "tps")?;
+            let calldata = stressAddCall { iters: U256::from(iters) }.abi_encode();
+            spam_calldata(stress, calldata, format!("stressAdd({iters})"), tps).await?;
+        }
+        "spam-mulmod" => {
+            let stress = parse_address_arg(args.next(), "stress_address")?;
+            let iters = parse_u64_arg(args.next(), "iters")?;
+            let tps = parse_f64_arg(args.next(), "tps")?;
+            let calldata = stressMulmodCall { iters: U256::from(iters) }.abi_encode();
+            spam_calldata(stress, calldata, format!("stressMulmod({iters})"), tps).await?;
+        }
+        "spam-keccak" => {
+            let stress = parse_address_arg(args.next(), "stress_address")?;
+            let iters = parse_u64_arg(args.next(), "iters")?;
+            let tps = parse_f64_arg(args.next(), "tps")?;
+            let calldata = stressKeccakCall { iters: U256::from(iters) }.abi_encode();
+            spam_calldata(stress, calldata, format!("stressKeccak({iters})"), tps).await?;
+        }
+        "spam-ecrecover" => {
+            let stress = parse_address_arg(args.next(), "stress_address")?;
+            let iters = parse_u64_arg(args.next(), "iters")?;
+            let tps = parse_f64_arg(args.next(), "tps")?;
+            let calldata = stressEcrecoverCall { iters: U256::from(iters) }.abi_encode();
+            spam_calldata(stress, calldata, format!("stressEcrecover({iters})"), tps).await?;
+        }
+        "spam-blake2f" => {
+            let stress = parse_address_arg(args.next(), "stress_address")?;
+            let iters = parse_u64_arg(args.next(), "iters")?;
+            let tps = parse_f64_arg(args.next(), "tps")?;
+            let calldata = stressBlake2fCall { iters: U256::from(iters) }.abi_encode();
+            spam_calldata(stress, calldata, format!("stressBlake2f({iters})"), tps).await?;
         }
         "balance" => {
             let token_address = parse_address_arg(args.next(), "token_address")?;
@@ -60,6 +112,13 @@ fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  tx-spammer deploy");
     eprintln!("  tx-spammer spam <token_address> <tps>");
+    eprintln!("  tx-spammer deploy-zkgas-stress");
+    eprintln!("  tx-spammer spam-add <stress_address> <iters> <tps>");
+    eprintln!("  tx-spammer spam-mulmod <stress_address> <iters> <tps>");
+    eprintln!("  tx-spammer spam-keccak <stress_address> <iters> <tps>");
+    eprintln!("  tx-spammer spam-ecrecover <stress_address> <iters> <tps>");
+    eprintln!("  tx-spammer spam-blake2f <stress_address> <iters> <tps>");
+    eprintln!("  tx-spammer spam-modexp <stress_address> <iters> <tps>");
     eprintln!("  tx-spammer balance <token_address> <owner_address>");
     eprintln!("  tx-spammer block <block_number>");
 }
@@ -113,6 +172,90 @@ async fn deploy() -> Result<Address> {
     receipt
         .contract_address
         .ok_or_else(|| eyre!("No contract address in receipt"))
+}
+
+async fn deploy_zkgas_stress() -> Result<Address> {
+    let (signer, from) = signer_and_from()?;
+    let provider = ProviderBuilder::new()
+        .with_recommended_fillers()
+        .wallet(EthereumWallet::from(signer))
+        .on_http(rpc_url().parse()?);
+
+    let artifact = std::fs::read_to_string("out/ZkGasStress.sol/ZkGasStress.json")?;
+    let artifact_json: serde_json::Value = serde_json::from_str(&artifact)?;
+    let bytecode_hex = artifact_json["bytecode"]["object"]
+        .as_str()
+        .ok_or_else(|| eyre!("bytecode.object not found in artifact"))?;
+    let bytecode = hex::decode(bytecode_hex.trim_start_matches("0x"))?;
+
+    println!("from: {from}");
+    let deploy_tx = TransactionRequest::default()
+        .from(from)
+        .with_deploy_code(bytecode);
+
+    let receipt = provider
+        .send_transaction(deploy_tx)
+        .await?
+        .get_receipt()
+        .await?;
+    receipt
+        .contract_address
+        .ok_or_else(|| eyre!("No contract address in receipt"))
+}
+
+async fn spam_calldata(
+    stress: Address,
+    calldata: Vec<u8>,
+    label: String,
+    tps: f64,
+) -> Result<()> {
+    if tps <= 0.0 {
+        return Err(eyre!("tps must be greater than 0"));
+    }
+
+    let (signer, from) = signer_and_from()?;
+    let provider = ProviderBuilder::new()
+        .with_recommended_fillers()
+        .wallet(EthereumWallet::from(signer))
+        .on_http(rpc_url().parse()?);
+
+    println!("Spamming {label} on {stress} at {tps} TPS...");
+
+    let mut interval = tokio::time::interval(Duration::from_secs_f64(1.0 / tps));
+    let mut count: u64 = 0;
+
+    loop {
+        interval.tick().await;
+
+        let latest_block = provider
+            .get_block_by_number(BlockNumberOrTag::Latest, BlockTransactionsKind::Hashes)
+            .await?
+            .ok_or_else(|| eyre!("latest block not found"))?;
+
+        let mut base_fee = u128::from(latest_block.header.base_fee_per_gas.unwrap_or(25_000_000));
+        if base_fee < 25_000_000 {
+            base_fee = 25_000_000;
+        }
+
+        let max_priority_fee_per_gas = provider.get_max_priority_fee_per_gas().await?;
+        let max_fee_per_gas = base_fee
+            .saturating_mul(2)
+            .saturating_add(max_priority_fee_per_gas);
+
+        let tx = TransactionRequest::default()
+            .from(from)
+            .to(stress)
+            .input(calldata.clone().into())
+            .with_max_fee_per_gas(max_fee_per_gas)
+            .with_max_priority_fee_per_gas(max_priority_fee_per_gas);
+
+        let _ = provider.send_transaction(tx).await?;
+
+        count += 1;
+        if count % 1000 == 0 {
+            println!("Sent {count} transactions");
+        }
+    }
 }
 
 async fn spam(contract: Address, tps: f64) -> Result<()> {
