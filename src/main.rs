@@ -2,7 +2,6 @@ use alloy::eips::eip2718::Encodable2718;
 use alloy::sol_types::SolCall;
 use alloy::{
     dyn_abi::DynSolValue,
-    eips::BlockNumberOrTag,
     network::{EthereumWallet, TransactionBuilder},
     primitives::{Address, U256},
     providers::{Provider, ProviderBuilder},
@@ -40,11 +39,6 @@ async fn main() -> Result<()> {
             println!("Contract deployed at: {contract}");
         }
         "spam" => {
-            let token_address = parse_address_arg(args.next(), "token_address")?;
-            let tps = parse_f64_arg(args.next(), "tps")?;
-            spam(token_address, tps).await?;
-        }
-        "spam-batch" => {
             let token_address = parse_address_arg(args.next(), "token_address")?;
             let tps = parse_f64_arg(args.next(), "tps")?;
             spam_batch(token_address, tps).await?;
@@ -228,67 +222,18 @@ async fn deploy_zkgas_stress() -> Result<Address> {
         .ok_or_else(|| eyre!("No contract address in receipt"))
 }
 
-async fn spam_calldata(stress: Address, calldata: Vec<u8>, label: String, tps: f64) -> Result<()> {
-    if tps <= 0.0 {
-        return Err(eyre!("tps must be greater than 0"));
-    }
-
-    let (signer, from) = signer_and_from()?;
-    let provider = ProviderBuilder::new()
-        .with_recommended_fillers()
-        .wallet(EthereumWallet::from(signer))
-        .on_http(rpc_url().parse()?);
-
-    println!("Spamming {label} on {stress} at {tps} TPS...");
-
-    let mut interval = tokio::time::interval(Duration::from_secs_f64(1.0 / tps));
-    let mut count: u64 = 0;
-
-    loop {
-        interval.tick().await;
-
-        let latest_block = provider
-            .get_block_by_number(BlockNumberOrTag::Latest, BlockTransactionsKind::Hashes)
-            .await?
-            .ok_or_else(|| eyre!("latest block not found"))?;
-
-        let mut base_fee = u128::from(latest_block.header.base_fee_per_gas.unwrap_or(25_000_000));
-        if base_fee < 25_000_000 {
-            base_fee = 25_000_000;
-        }
-
-        let max_priority_fee_per_gas = provider.get_max_priority_fee_per_gas().await?;
-        let max_fee_per_gas = base_fee
-            .saturating_mul(2)
-            .saturating_add(max_priority_fee_per_gas);
-
-        let tx = TransactionRequest::default()
-            .from(from)
-            .to(stress)
-            .input(calldata.clone().into())
-            .with_max_fee_per_gas(max_fee_per_gas)
-            .with_max_priority_fee_per_gas(max_priority_fee_per_gas);
-
-        let _ = provider.send_transaction(tx).await?;
-
-        count += 1;
-        if count % 1000 == 0 {
-            println!("Sent {count} transactions");
-        }
-    }
-}
-
-async fn spam_batch_calldata(
+// Core implementation — calldata is generated per-transaction via closure,
+// allowing both fixed calldata and randomized calldata (e.g. ERC20 transfers).
+async fn spam_batch_inner(
     contract: Address,
-    calldata: Vec<u8>,
-    label: String,
     tps: f64,
+    label: String,
+    mut make_calldata: impl FnMut() -> Vec<u8>,
 ) -> Result<()> {
     if tps <= 0.0 {
         return Err(eyre!("tps must be greater than 0"));
     }
 
-    // Build these once, outside the loop
     let (signer, from) = signer_and_from()?;
     let wallet = EthereumWallet::from(signer);
     let client = reqwest::Client::new();
@@ -303,28 +248,15 @@ async fn spam_batch_calldata(
     let txs_per_second = tps.ceil() as u64;
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     let mut count: u64 = 0;
-
     let mut nonce = provider.get_transaction_count(from).await?;
 
     loop {
         interval.tick().await;
         let start = std::time::Instant::now();
 
-        // Batch the fee-fetching RPC calls together with a manual JSON-RPC batch
-        // so we pay only one round-trip instead of two sequential awaits.
         let fee_batch = serde_json::json!([
-            {
-                "jsonrpc": "2.0",
-                "method": "eth_getBlockByNumber",
-                "params": ["latest", false],
-                "id": 1
-            },
-            {
-                "jsonrpc": "2.0",
-                "method": "eth_maxPriorityFeePerGas",
-                "params": [],
-                "id": 2
-            }
+            { "jsonrpc": "2.0", "method": "eth_getBlockByNumber", "params": ["latest", false], "id": 1 },
+            { "jsonrpc": "2.0", "method": "eth_maxPriorityFeePerGas", "params": [], "id": 2 }
         ]);
 
         let fee_results: Vec<serde_json::Value> = client
@@ -335,7 +267,6 @@ async fn spam_batch_calldata(
             .json()
             .await?;
 
-        // Parse base fee from block result (id=1)
         let block_result = fee_results
             .iter()
             .find(|r| r["id"] == 1)
@@ -350,26 +281,24 @@ async fn spam_batch_calldata(
 
         let base_fee = raw_base_fee.max(25_000_000);
 
-        // Parse priority fee (id=2)
         let max_priority_fee_per_gas = fee_results
             .iter()
             .find(|r| r["id"] == 2)
             .and_then(|r| r["result"].as_str())
             .and_then(|s| u128::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-            .unwrap_or(1_000_000_000); // 1 gwei fallback
+            .unwrap_or(1_000_000_000);
 
         let max_fee_per_gas = base_fee
             .saturating_mul(2)
             .saturating_add(max_priority_fee_per_gas);
 
-        // Build and sign all transactions, then pack into one batch request
         let mut tx_batch = Vec::with_capacity(txs_per_second as usize);
-        
+
         for i in 0..txs_per_second {
             let tx = TransactionRequest::default()
                 .from(from)
                 .to(contract)
-                .input(calldata.clone().into())
+                .input(make_calldata().into()) // <-- only difference from the two old functions
                 .with_nonce(nonce + i)
                 .with_gas_limit(10_000_000)
                 .with_chain_id(167011)
@@ -387,14 +316,11 @@ async fn spam_batch_calldata(
             }));
         }
 
-        // Single HTTP request for all transactions
         let response = client.post(&rpc).json(&tx_batch).send().await?;
-
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await?;
             eprintln!("Batch request failed with status {status}: {body}");
-            // Don't adjust nonce blindly — re-fetch to get the true on-chain value
             nonce = provider.get_transaction_count(from).await?;
             continue;
         }
@@ -412,7 +338,6 @@ async fn spam_batch_calldata(
                 failed += 1;
             } else {
                 sent += 1;
-                // id is 1-based, so offset into nonce is id - 1
                 highest_successful_nonce_offset = Some(
                     highest_successful_nonce_offset
                         .unwrap_or(0)
@@ -421,19 +346,16 @@ async fn spam_batch_calldata(
             }
         }
 
-        // Advance nonce past the highest tx that was accepted
         if let Some(offset) = highest_successful_nonce_offset {
             nonce += offset + 1;
         }
 
-        // On any failure, re-sync from chain to avoid getting stuck
         if failed > 0 {
             eprintln!("{failed} txs failed — resyncing nonce from chain");
             nonce = provider.get_transaction_count(from).await?;
         }
 
         count += sent;
-
         let elapsed = start.elapsed().as_millis();
         println!("Sent {sent}/{txs_per_second} txs in {elapsed} ms");
 
@@ -443,269 +365,28 @@ async fn spam_batch_calldata(
     }
 }
 
+// Fixed calldata — same bytes every tx (stress tests, etc.)
+async fn spam_batch_calldata(
+    contract: Address,
+    calldata: Vec<u8>,
+    label: String,
+    tps: f64,
+) -> Result<()> {
+    spam_batch_inner(contract, tps, label, || calldata.clone()).await
+}
+
+// Random calldata — new recipient every tx (ERC20 transfers)
 async fn spam_batch(contract: Address, tps: f64) -> Result<()> {
-    if tps <= 0.0 {
-        return Err(eyre!("tps must be greater than 0"));
-    }
-
-    // Build these once, outside the loop
-    let (signer, from) = signer_and_from()?;
-    let wallet = EthereumWallet::from(signer);
-    let client = reqwest::Client::new();
-    let rpc = rpc_url();
-
-    let provider = ProviderBuilder::new()
-        .wallet(wallet.clone())
-        .on_http(rpc.parse()?);
-
-    println!("Spamming ERC20 transfers for {contract} at {tps} TPS (batched)...");
-
-    let txs_per_second = tps.ceil() as u64;
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
     let mut rng = rand::thread_rng();
-    let mut count: u64 = 0;
-
-    let mut nonce = provider.get_transaction_count(from).await?;
-
-    loop {
-        interval.tick().await;
-        let start = std::time::Instant::now();
-
-        // Batch the fee-fetching RPC calls together with a manual JSON-RPC batch
-        // so we pay only one round-trip instead of two sequential awaits.
-        let fee_batch = serde_json::json!([
-            {
-                "jsonrpc": "2.0",
-                "method": "eth_getBlockByNumber",
-                "params": ["latest", false],
-                "id": 1
-            },
-            {
-                "jsonrpc": "2.0",
-                "method": "eth_maxPriorityFeePerGas",
-                "params": [],
-                "id": 2
-            }
-        ]);
-
-        let fee_results: Vec<serde_json::Value> = client
-            .post(&rpc)
-            .json(&fee_batch)
-            .send()
-            .await?
-            .json()
-            .await?;
-
-        // Parse base fee from block result (id=1)
-        let block_result = fee_results
-            .iter()
-            .find(|r| r["id"] == 1)
-            .and_then(|r| r["result"].as_object())
-            .ok_or_else(|| eyre!("missing block result"))?;
-
-        let raw_base_fee = block_result
-            .get("baseFeePerGas")
-            .and_then(|v| v.as_str())
-            .and_then(|s| u128::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-            .unwrap_or(25_000_000);
-
-        let base_fee = raw_base_fee.max(25_000_000);
-
-        // Parse priority fee (id=2)
-        let max_priority_fee_per_gas = fee_results
-            .iter()
-            .find(|r| r["id"] == 2)
-            .and_then(|r| r["result"].as_str())
-            .and_then(|s| u128::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-            .unwrap_or(1_000_000_000); // 1 gwei fallback
-
-        let max_fee_per_gas = base_fee
-            .saturating_mul(2)
-            .saturating_add(max_priority_fee_per_gas);
-
-        // Build and sign all transactions, then pack into one batch request
-        let mut tx_batch = Vec::with_capacity(txs_per_second as usize);
-
-        for i in 0..txs_per_second {
-            let to = Address::from(rng.r#gen::<[u8; 20]>());
-            let calldata = transferCall {
-                to,
-                amount: U256::from(1u64),
-            }
-            .abi_encode();
-
-            let tx = TransactionRequest::default()
-                .from(from)
-                .to(contract)
-                .input(calldata.into())
-                .with_nonce(nonce + i)
-                .with_gas_limit(10_000_000)
-                .with_chain_id(167011)
-                .with_max_fee_per_gas(max_fee_per_gas)
-                .with_max_priority_fee_per_gas(max_priority_fee_per_gas);
-
-            let envelope = tx.build(&wallet).await?;
-            let raw_tx = format!("0x{}", hex::encode(envelope.encoded_2718()));
-
-            tx_batch.push(serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "eth_sendRawTransaction",
-                "params": [raw_tx],
-                "id": i + 1
-            }));
+    spam_batch_inner(contract, tps, "ERC20 transfers".to_string(), || {
+        let to = Address::from(rng.r#gen::<[u8; 20]>());
+        transferCall {
+            to,
+            amount: U256::from(1u64),
         }
-
-        // Single HTTP request for all transactions
-        let response = client.post(&rpc).json(&tx_batch).send().await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await?;
-            eprintln!("Batch request failed with status {status}: {body}");
-            // Don't adjust nonce blindly — re-fetch to get the true on-chain value
-            nonce = provider.get_transaction_count(from).await?;
-            continue;
-        }
-
-        let results: Vec<serde_json::Value> = response.json().await?;
-
-        let mut sent = 0u64;
-        let mut failed = 0u64;
-        let mut highest_successful_nonce_offset: Option<u64> = None;
-
-        for result in &results {
-            let id = result["id"].as_u64().unwrap_or(0);
-            if result.get("error").is_some() {
-                eprintln!("Tx id={id} failed: {}", result["error"]);
-                failed += 1;
-            } else {
-                sent += 1;
-                // id is 1-based, so offset into nonce is id - 1
-                highest_successful_nonce_offset = Some(
-                    highest_successful_nonce_offset
-                        .unwrap_or(0)
-                        .max(id.saturating_sub(1)),
-                );
-            }
-        }
-
-        // Advance nonce past the highest tx that was accepted
-        if let Some(offset) = highest_successful_nonce_offset {
-            nonce += offset + 1;
-        }
-
-        // On any failure, re-sync from chain to avoid getting stuck
-        if failed > 0 {
-            eprintln!("{failed} txs failed — resyncing nonce from chain");
-            nonce = provider.get_transaction_count(from).await?;
-        }
-
-        count += sent;
-
-        let elapsed = start.elapsed().as_millis();
-        println!("Sent {sent}/{txs_per_second} txs in {elapsed} ms");
-
-        if count % 10_000 == 0 && count > 0 {
-            println!("Total sent: {count} transactions");
-        }
-    }
-}
-
-async fn spam(contract: Address, tps: f64) -> Result<()> {
-    if tps <= 0.0 {
-        return Err(eyre!("tps must be greater than 0"));
-    }
-
-    let (signer, from) = signer_and_from()?;
-    let provider = ProviderBuilder::new()
-        //.with_recommended_fillers()
-        .wallet(EthereumWallet::from(signer))
-        .on_http(rpc_url().parse()?);
-
-    println!("Spamming ERC20 transfers for {contract} at {tps} TPS...");
-
-    let txs_per_second = tps.ceil() as u64;
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
-    let mut rng = rand::thread_rng();
-    let mut count: u64 = 0;
-
-    // Fetch initial nonce once before the loop
-    let mut nonce = provider.get_transaction_count(from).await?;
-
-    loop {
-        interval.tick().await;
-        let start = std::time::Instant::now();
-        // Fetch gas params ONCE per block, not per transaction
-        let latest_block = provider
-            .get_block_by_number(BlockNumberOrTag::Latest, BlockTransactionsKind::Hashes)
-            .await?
-            .ok_or_else(|| eyre!("latest block not found"))?;
-
-        let mut base_fee = u128::from(latest_block.header.base_fee_per_gas.unwrap_or(25_000_000));
-        if base_fee < 25_000_000 {
-            base_fee = 25_000_000;
-        }
-
-        let max_priority_fee_per_gas = provider.get_max_priority_fee_per_gas().await?;
-        let max_fee_per_gas = base_fee
-            .saturating_mul(2)
-            .saturating_add(max_priority_fee_per_gas);
-
-        // Fire all txs for this second concurrently, each with its own nonce
-        let mut futures = Vec::with_capacity(txs_per_second as usize);
-
-        for _ in 0..txs_per_second {
-            let to = Address::from(rng.r#gen::<[u8; 20]>());
-            let calldata = transferCall {
-                to,
-                amount: U256::from(1u64),
-            }
-            .abi_encode();
-
-            let tx = TransactionRequest::default()
-                .from(from)
-                .to(contract)
-                .input(calldata.into())
-                .with_nonce(nonce)
-                .with_gas_limit(10_000_000)
-                .with_chain_id(167011)
-                .with_max_fee_per_gas(max_fee_per_gas)
-                .with_max_priority_fee_per_gas(max_priority_fee_per_gas);
-            //println!("Prepared tx with nonce {}", nonce);
-            nonce += 1;
-            futures.push(provider.send_transaction(tx));
-        }
-
-        // Send all transactions in this batch concurrently
-        let results = futures::future::join_all(futures).await;
-
-        let mut sent = 0u64;
-        let mut failed = 0u64;
-
-        for (i, result) in results.iter().enumerate() {
-            match result {
-                Ok(_) => sent += 1,
-                Err(e) => {
-                    eprintln!("Tx {i} failed: {e}");
-                    failed += 1;
-                }
-            }
-        }
-
-        count += sent;
-
-        if failed > 0 {
-            eprintln!("Batch had {failed} failures, resyncing nonce...");
-            nonce -= failed;
-        }
-
-        let elapsed = start.elapsed().as_millis();
-        println!("Elapsed {elapsed} ms");
-
-        if count % 10_000 == 0 {
-            println!("Sent {count} transactions");
-        }
-    }
+        .abi_encode()
+    })
+    .await
 }
 
 async fn erc20_balance(token: Address, owner: Address) -> Result<U256> {
