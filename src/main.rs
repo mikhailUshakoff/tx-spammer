@@ -250,6 +250,16 @@ async fn spam_batch_inner(
     let mut count: u64 = 0;
     let mut nonce = provider.get_transaction_count(from).await?;
 
+    //Calculate gas limit
+    let tx = TransactionRequest::default()
+                .from(from)
+                .to(contract)
+                .input(make_calldata().into()) // <-- only difference from the two old functions
+                .with_nonce(nonce)
+                .with_chain_id(167011);
+    let gas_limit = provider.estimate_gas(&tx).await?;
+    println!("Estimated gas limit: {gas_limit}");
+
     loop {
         interval.tick().await;
         let start = std::time::Instant::now();
@@ -300,7 +310,7 @@ async fn spam_batch_inner(
                 .to(contract)
                 .input(make_calldata().into()) // <-- only difference from the two old functions
                 .with_nonce(nonce + i)
-                .with_gas_limit(10_000_000)
+                .with_gas_limit(gas_limit)
                 .with_chain_id(167011)
                 .with_max_fee_per_gas(max_fee_per_gas)
                 .with_max_priority_fee_per_gas(max_priority_fee_per_gas);
