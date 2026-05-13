@@ -299,7 +299,7 @@ async fn spam_batch_inner(
             .unwrap_or(1_000_000_000);
 
         let max_fee_per_gas = base_fee
-            .saturating_mul(2)
+            .saturating_mul(5)
             .saturating_add(max_priority_fee_per_gas);
 
         let mut tx_batch = Vec::with_capacity(txs_per_second as usize);
